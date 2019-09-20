@@ -1,0 +1,291 @@
+daml 1.2
+
+module Healthcare where
+
+import DA.Foldable (toList)
+import DA.Text (sha256)
+import DA.Time
+import DA.Date
+import DA.List
+import DA.Optional
+
+template Accreditation
+  with
+    doctor : Party
+    trustedAuthority : Party
+  where
+    signatory trustedAuthority
+    observer doctor
+
+    key (trustedAuthority, doctor) : (Party, Party)
+    maintainer key._1
+
+template PharmacyLicense
+  with
+    pharmacy : Party
+    trustedAuthority : Party
+  where
+    signatory trustedAuthority
+    observer pharmacy
+
+    key (trustedAuthority, pharmacy) : (Party, Party)
+    maintainer key._1
+
+type SHA256 = Text
+
+data AppointmentLocation = DoctorsPractice | PatientAddress Text deriving (Eq, Show)
+
+template CounterProposal 
+  with
+    appointment : DoctorsAppointment
+  where
+    signatory appointment.doctor
+
+    controller appointment.patient can 
+      AcceptCounterProposal : ContractId DoctorsAppointment
+        do create appointment
+
+      RejectCounterProposal : ()
+        do return () 
+
+  
+template AppointmentRequest
+  with
+    appointment : DoctorsAppointment    
+  where
+    signatory appointment.patient
+
+    controller appointment.doctor can 
+      AcceptAppointmentRequest : ContractId DoctorsAppointment
+        do create appointment
+
+      RejectAppointmentRequest : ()
+        do return () 
+
+      ProposeNewTime : ContractId CounterProposal
+        with 
+           newTime : Time
+        do 
+           create CounterProposal with appointment = appointment with scheduledFor = newTime
+
+
+template PatientRecord
+  with
+    patient : Party
+    trustedAuthority : Party
+    notes : [ContractId DoctorsNote]
+    observers : [Party]
+  where
+    signatory trustedAuthority, patient
+    observer observers
+
+    controller patient can
+        AddPatientRecordObserver : ContractId PatientRecord
+            with
+                obs : Party
+            do
+                create this with observers = obs :: observers
+        
+    choice AddDoctorsNote : ContractId PatientRecord 
+      with
+        note : ContractId DoctorsNote
+        doctor : Party
+      controller doctor, patient
+      do
+        assert (doctor /= patient)
+
+        accreditation <- lookupByKey @Accreditation (trustedAuthority, doctor)
+        assert (accreditation /= None)
+
+        -- accreditationData <- fetch accreditation
+
+        -- assert (accreditationData.doctor == doctor)
+        -- assert (accreditationData.trustedAuthority == trustedAuthority)
+
+        create this with notes = note :: notes
+
+data PrecriptionState = Unused | Exchanged Party deriving (Eq, Show)
+
+type Medication = Text
+
+template Prescription
+  with
+    doctor : Party
+    patient : Party
+    medication : Medication
+    dosage : Decimal
+    state : PrecriptionState
+    observers : [Party]
+    prescribedOn : Time
+    trustedAuthority : Party
+  where
+    signatory doctor
+    observer observers
+
+    key (doctor, patient, prescribedOn, medication) : (Party, Party, Time, Text)
+
+    maintainer key._1
+
+    choice Exchange : ContractId Prescription
+      with
+        pharmacy : Party
+      controller patient, pharmacy
+      do
+        fetchByKey @PharmacyLicense (trustedAuthority, pharmacy)
+
+        assert (state == Unused)
+        create this with state = Exchanged pharmacy
+
+    controller patient can
+      AddPrescriptionObserver : ContractId Prescription
+        with obs : Party
+        do create this with observers = dedup (obs :: observers)
+
+template DoctorsNote
+  with
+    doctor : Party
+    patient : Party
+    note : Text
+    writtenOn : Time
+    prescriptions : [Medication]
+  where
+    signatory doctor
+    observer patient
+
+    controller patient can
+      nonconsuming GetPrescriptions : [ContractId Prescription]
+        do fmap catOptionals $ mapA (\medicine -> lookupByKey @Prescription (doctor, patient, writtenOn, medicine)) prescriptions
+
+template DoctorsAppointment
+  with
+    record : ContractId PatientRecord 
+    doctor : Party
+    patient : Party
+    location : AppointmentLocation
+    scheduledFor : Time
+  where
+    signatory patient, doctor
+
+    controller doctor can
+      AppendPatientRecord : ContractId PatientRecord
+        with
+          note : ContractId DoctorsNote
+        do
+          recordData <- fetch record
+          noteData <- fetch note
+          assert $ noteData.doctor == doctor
+          assert $ recordData.patient == patient
+          assert $ noteData.patient == patient
+
+          exercise record AddDoctorsNote with note, doctor
+      
+template RequestNewPatientRecord 
+    with 
+        trustedAuthority : Party
+        patient : Party
+    where
+        signatory patient
+
+        controller trustedAuthority can
+            Authorize : ContractId PatientRecord
+                do
+                    create PatientRecord with patient, trustedAuthority, notes = [], observers = []
+
+template PurchaseMedicineRequest 
+  with
+    prescription : ContractId Prescription
+    pharmacy : Party
+    patient : Party
+  where
+    signatory patient
+
+    controller pharmacy can
+      ProvideMedication : ContractId Prescription
+        do exercise prescription Exchange with pharmacy
+
+
+
+petersStory = scenario do
+  patient <- getParty "Peter"
+  doctor <- getParty "Daisy"
+  pharmacy <- getParty "MyMeds"
+  trustedAuthority <- getParty "ABMS"
+
+  submit trustedAuthority do
+    create PharmacyLicense with pharmacy, trustedAuthority
+    create Accreditation with doctor, trustedAuthority
+  
+  newPatientRecordRequest <- submit patient do
+                                create RequestNewPatientRecord with 
+                                        trustedAuthority
+                                        patient
+                
+  patientRecord <- submit trustedAuthority do
+                        exercise newPatientRecordRequest Authorize
+
+  patientRecord <- submit patient do 
+                        exercise patientRecord AddPatientRecordObserver with obs = doctor
+
+  appointmentRequest <- submit patient do 
+                            let suggested = time (date 10 Jan 2020) 10 0 0
+
+                            let appointment = DoctorsAppointment with 
+                                                record = patientRecord
+                                                doctor
+                                                patient
+                                                location = DoctorsPractice
+                                                scheduledFor = suggested                                                 
+
+                            create AppointmentRequest with appointment 
+
+  appointment <- submit doctor do
+                    exercise appointmentRequest AcceptAppointmentRequest 
+
+  let doctorsNoteWrittenOn = time (date 10 Jan 2020) 10 30 0
+
+  submit doctor do
+      create Prescription
+        with
+          state = Unused
+          doctor
+          patient
+          medication = "Morphine"
+          dosage = 0.5
+          trustedAuthority
+          prescribedOn = doctorsNoteWrittenOn
+          observers = []
+
+  note <- submit doctor do
+            create DoctorsNote with
+                doctor
+                patient
+                note = "Peter came to see me today, " <> 
+                        "he was complaining of serious pain " <>
+                        "with an injury sustained at work. " <>
+                        "I prescribed him some Morphine"
+
+                writtenOn = time (date 10 Jan 2020) 10 30 0
+                prescriptions = ["Morphine"]
+
+  submit doctor do  
+    exercise appointment AppendPatientRecord with note
+
+  purchaseRequest <- submit patient do
+                      prescriptions <- exercise note GetPrescriptions
+                      
+                      let prescription = head prescriptions
+
+                      prescription <- exercise prescription AddPrescriptionObserver with obs = pharmacy
+
+                      create PurchaseMedicineRequest with
+                                            prescription
+                                            pharmacy
+                                            patient
+
+
+  submit pharmacy do
+    exercise purchaseRequest ProvideMedication
+
+
+
+  return ()   
